@@ -66,13 +66,32 @@
 
   document.addEventListener('visibilitychange', () => { (document.hidden ? hideH : showH).forEach(f => f({})); });
 
-  // 音效：第一次触摸后解锁
-  let unlocked = false;
+  // 音效：用 Web Audio 预先解码，播放几乎零延迟；第一次触摸时解锁（浏览器要求）
+  let actx = null;
+  const buffers = {};
   function unlockAudio() {
-    if (unlocked) return; unlocked = true;
-    try { Object.values(window.__AUDIO__ || {}).forEach(a => { a.muted = true; const p = a.play(); if (p && p.then) p.then(() => { a.pause(); a.muted = false; a.currentTime = 0; }).catch(() => { a.muted = false; }); else a.muted = false; }); } catch (e) {}
+    if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      actx = new AC();
+      Object.keys(window.__WAV__ || {}).forEach(name => {
+        const b64 = window.__WAV__[name].split(',')[1];
+        const bin = atob(b64);
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        const done = buf => { buffers[name] = buf; };
+        const p = actx.decodeAudioData(arr.buffer, done, () => {});
+        if (p && p.then) p.then(done).catch(() => {});
+      });
+      // iOS 需要在手势里播一段静音来真正解锁
+      const src = actx.createBufferSource(); src.buffer = actx.createBuffer(1, 1, 22050); src.connect(actx.destination); src.start(0);
+    } catch (e) { actx = null; }
   }
-  window.__AUDIO__ = {};
+  function playSound(name) {
+    if (!actx || !buffers[name]) return;
+    try { const src = actx.createBufferSource(); src.buffer = buffers[name]; src.connect(actx.destination); src.start(0); } catch (e) {}
+  }
 
   // 昵称输入：页面内输入框（沙盒里不能用 prompt）
   const box = document.getElementById('kb');
@@ -91,9 +110,13 @@
   window.wx = {
     getWindowInfo() {
       const W = rotated ? vh : vw, H = rotated ? vw : vh;
-      return { windowWidth: W, windowHeight: H, pixelRatio: Math.min(window.devicePixelRatio || 1, 2.5), safeArea: { left: 0, right: W, top: 0, bottom: H, width: W, height: H } };
+      return { windowWidth: W, windowHeight: H, pixelRatio: Math.min(window.devicePixelRatio || 1, 2), safeArea: { left: 0, right: W, top: 0, bottom: H, width: W, height: H } };
     },
-    createCanvas() { return canvas; },
+    createCanvas() {
+      // 第一次返回屏幕画布，之后返回离屏画布（与小游戏行为一致）
+      if (!window.__mainCanvasGiven) { window.__mainCanvasGiven = true; return canvas; }
+      return document.createElement('canvas');
+    },
     onTouchStart: f => touchHandlers.start.push(f),
     onTouchMove: f => touchHandlers.move.push(f),
     onTouchEnd: f => touchHandlers.end.push(f),
@@ -101,13 +124,9 @@
     getStorageSync: lsGet,
     setStorageSync: lsSet,
     createInnerAudioContext() {
-      const a = { src: '', obeyMuteSwitch: true, _el: null };
-      a.play = () => {
-        const name = (a.src.split('/').pop() || '').replace('.wav', '');
-        if (!a._el && window.__WAV__[name]) { a._el = new Audio(window.__WAV__[name]); window.__AUDIO__[name] = a._el; }
-        if (a._el) { try { a._el.currentTime = 0; const p = a._el.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {} }
-      };
-      a.stop = () => { if (a._el) { try { a._el.pause(); } catch (e) {} } };
+      const a = { src: '', obeyMuteSwitch: true };
+      a.play = () => playSound((a.src.split('/').pop() || '').replace('.wav', ''));
+      a.stop = () => {};
       a.seek = () => {};
       return a;
     },
@@ -277,6 +296,14 @@ core.init = function (canvas) {
   core.safe.left = Math.max(core.safe.left, 16);
   core.safe.right = Math.max(core.safe.right, 16);
   core.bindInput();
+};
+
+// 离屏画布：小游戏里第二次及之后调用 wx.createCanvas 得到的就是离屏画布
+core.createOffscreen = function (w, h) {
+  const c = wx.createCanvas();
+  if (c === core.canvas) return null;
+  c.width = w; c.height = h;
+  return c;
 };
 
 core.setScene = function (scene) {
@@ -561,7 +588,8 @@ const glyphs = {
 function panel(ctx, x, y, w, h, opt) {
   opt = opt || {};
   ctx.save();
-  ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = 24; ctx.shadowOffsetY = 8;
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  rr(ctx, x + 4, y + 10, w, h, opt.r || 26); ctx.fill();
   const g = ctx.createLinearGradient(0, y, 0, y + h);
   g.addColorStop(0, opt.c1 || '#fffaf0'); g.addColorStop(1, opt.c2 || '#f1e6cf');
   ctx.fillStyle = g;
@@ -642,12 +670,12 @@ function card(ctx, id, x, y, w, h, opt) {
   opt = opt || {};
   const r = w * 0.09;
   ctx.save();
-  if (opt.shadow !== false) { ctx.shadowColor = 'rgba(0,0,0,0.35)'; ctx.shadowBlur = 6; ctx.shadowOffsetY = 2; }
+  if (opt.shadow !== false && !opt.faceDown) { ctx.fillStyle = 'rgba(0,0,0,0.28)'; rr(ctx, x + 1, y + 3, w, h, r); ctx.fill(); }
   if (opt.faceDown) {
     const g = ctx.createLinearGradient(x, y, x + w, y + h);
     g.addColorStop(0, '#7a1f2b'); g.addColorStop(1, '#4a0f18');
+    ctx.fillStyle = 'rgba(0,0,0,0.28)'; rr(ctx, x + 1, y + 3, w, h, r); ctx.fill();
     ctx.fillStyle = '#f7f0e0'; rr(ctx, x, y, w, h, r); ctx.fill();
-    ctx.shadowColor = 'transparent';
     ctx.fillStyle = g; rr(ctx, x + w * 0.07, y + w * 0.07, w * 0.86, h - w * 0.14, r * 0.7); ctx.fill();
     ctx.save();
     rr(ctx, x + w * 0.07, y + w * 0.07, w * 0.86, h - w * 0.14, r * 0.7); ctx.clip();
@@ -666,7 +694,6 @@ function card(ctx, id, x, y, w, h, opt) {
   else if (opt.horse) bg = '#d4e7ff';       // 马牌：浅蓝底
   ctx.fillStyle = bg;
   rr(ctx, x, y, w, h, r); ctx.fill();
-  ctx.shadowColor = 'transparent';
   ctx.lineWidth = 1.5; ctx.strokeStyle = '#b9b2a6';
   rr(ctx, x, y, w, h, r); ctx.stroke();
 
@@ -1360,6 +1387,27 @@ function findCombos(cardsLeft, cat, rules) {
   return found.sort((a, b) => b.strength - a.strength).map(x => x.cards);
 }
 
+// 一次遍历算出所有牌型按钮的可选组合（摆牌界面用；比逐个牌型调用 findCombos 快约 6 倍）
+function findAllCombos(cardsLeft, rules) {
+  const out = {};
+  [CAT.PAIR, CAT.TWO_PAIR, CAT.TRIPS, CAT.QUADS].forEach(c => { out[c] = findCombos(cardsLeft, c, rules); });
+  const five = { 4: [], 5: [], 6: [], 8: [], 9: [] };
+  const seen = {};
+  if (cardsLeft.length >= 5) {
+    combos(cardsLeft, 5, cs => {
+      const e = evalHand(cs, rules);
+      if (!five[e.cat]) return;
+      const flushy = e.cat === CAT.FLUSH || e.cat === CAT.STRAIGHT_FLUSH;
+      const sig = e.cat + ':' + cs.map(c => isJoker(c) ? 'J' : rankOf(c) + (flushy ? 's' + suitOf(c) : '')).sort().join(',');
+      if (seen[sig]) return;
+      seen[sig] = true;
+      five[e.cat].push({ cards: cs, strength: e.key });
+    });
+  }
+  Object.keys(five).forEach(c => { out[c] = five[c].sort((a, b) => b.strength - a.strength).map(x => cards.sortCards(x.cards)); });
+  return out;
+}
+
 // ---------- 特殊牌型 ----------
 // 快速判断：这几张牌（可含王）能否组成顺子 / 同花（用于特殊牌型，不经过完整判型）
 function canStraightW(cs, rules) {
@@ -1433,7 +1481,7 @@ function detectSpecial(hand, rules) {
 }
 
 module.exports = {
-  evalRanks, evalHand, rowName, isFoul, autoArrange, findCombos, detectSpecial,
+  evalRanks, evalHand, rowName, isFoul, autoArrange, findCombos, findAllCombos, detectSpecial,
   PICK_SIZE, forEachPartition, cardsOf
 };
 
@@ -1713,7 +1761,27 @@ const audio = require('../audio.js');
 const cfg = require('../rules/config.js');
 const rr = core.roundRect;
 
+// 背景（渐变 + 牌桌）每次尺寸变化只画一次到离屏画布，之后每帧直接贴图
+const bgCache = {};
 function background(ctx, withTable, logo) {
+  const key = [core.W, core.H, core.dpr, core.scale, withTable ? 1 : 0, logo ? 1 : 0].join('|');
+  let c = bgCache[key];
+  if (!c) {
+    let oc = null;
+    try { oc = core.createOffscreen(Math.round(core.W * core.scale * core.dpr), Math.round(core.H * core.scale * core.dpr)); } catch (e) { oc = null; }
+    if (oc) {
+      const octx = oc.getContext('2d');
+      octx.setTransform(core.dpr * core.scale, 0, 0, core.dpr * core.scale, 0, 0);
+      paintBackground(octx, withTable, logo);
+      Object.keys(bgCache).forEach(k => { delete bgCache[k]; });
+      c = bgCache[key] = oc;
+    }
+  }
+  if (c) ctx.drawImage(c, 0, 0, core.W, core.H);
+  else paintBackground(ctx, withTable, logo);
+}
+
+function paintBackground(ctx, withTable, logo) {
   const W = core.W, H = core.H;
   const g = ctx.createRadialGradient(W / 2, H / 2, 100, W / 2, H / 2, W * 0.7);
   g.addColorStop(0, '#3b1d44'); g.addColorStop(1, '#14081a');
@@ -1721,7 +1789,6 @@ function background(ctx, withTable, logo) {
   if (!withTable) return;
   const cx = W / 2, cy = H / 2 + 10;
   const rx = Math.min(W * 0.47, 860), ry = H * 0.47;
-  // 桌沿
   ctx.save();
   ctx.fillStyle = '#1a1216';
   ellipse(ctx, cx, cy + 8, rx + 26, ry + 26); ctx.fill();
@@ -2209,7 +2276,7 @@ function create(app, match) {
 
   function quickArrange() {
     if (S.submitted) return;
-    if (!S.suggestions) S.suggestions = ev.autoArrange(match.myHand(ME), rules, 5);
+    if (!S.suggestions) S.suggestions = ev.autoArrange(match.myHand(ME), rules, 5);  // 正常情况下发牌时已算好
     S.sIdx = (S.sIdx + 1) % S.suggestions.length;
     const sg = S.suggestions[S.sIdx];
     snapshot();
@@ -2224,9 +2291,8 @@ function create(app, match) {
   }
 
   function typeCombos(cat) {
-    if (!S.typeCache) S.typeCache = {};
-    if (!S.typeCache[cat]) S.typeCache[cat] = ev.findCombos(S.hand, cat, rules);
-    return S.typeCache[cat];
+    if (!S.typeCache) S.typeCache = ev.findAllCombos(S.hand, rules);
+    return S.typeCache[cat] || [];
   }
 
   function pickType(cat) {
@@ -2240,7 +2306,18 @@ function create(app, match) {
   }
 
   function isComplete() { return S.rows.front.length === 3 && S.rows.mid.length === 5 && S.rows.back.length === 5; }
-  function isFoulNow() { return isComplete() && ev.isFoul(S.rows.front, S.rows.mid, S.rows.back, rules); }
+  let foulMemo = { sig: '', v: false };
+  function isFoulNow() {
+    if (!isComplete()) return false;
+    const sig = S.rows.front.join(',') + '|' + S.rows.mid.join(',') + '|' + S.rows.back.join(',');
+    if (foulMemo.sig !== sig) foulMemo = { sig, v: ev.isFoul(S.rows.front, S.rows.mid, S.rows.back, rules) };
+    return foulMemo.v;
+  }
+  const evalMemo = {};
+  function evalRow(cs) {
+    const k = cs.join(',');
+    return evalMemo[k] || (evalMemo[k] = ev.evalHand(cs, rules));
+  }
 
   function confirmSubmit() {
     if (S.submitted || S.phase !== 'arranging') return;
@@ -2278,6 +2355,7 @@ function create(app, match) {
     S.selected = {}; S.undo = []; S.suggestions = null; S.sIdx = -1; changed();
     S.submitted = false; S.record = null; S.compare = null; S.timeoutNotified = false; S.lastTickSec = -1;
     S.special = rules.special.enabled ? ev.detectSpecial(S.hand, rules) : null;
+    S.suggestions = ev.autoArrange(S.hand, rules, 5);
     audio.play('deal');
   }
 
@@ -2668,7 +2746,7 @@ function create(app, match) {
     ctx.save();
     const g = ctx.createLinearGradient(0, L.panelY, 0, L.panelY + L.panelH);
     g.addColorStop(0, '#2f73dd'); g.addColorStop(1, '#173c8a');
-    ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = 20;
+    ctx.fillStyle = 'rgba(0,0,0,0.35)'; rr(ctx, L.panelX + 4, L.panelY + 8, L.panelW, L.panelH, 22); ctx.fill();
     ctx.fillStyle = g; rr(ctx, L.panelX, L.panelY, L.panelW, L.panelH, 22); ctx.fill();
     ctx.restore();
     ctx.strokeStyle = 'rgba(160,200,255,0.6)'; ctx.lineWidth = 3; rr(ctx, L.panelX, L.panelY, L.panelW, L.panelH, 22); ctx.stroke();
@@ -2685,7 +2763,7 @@ function create(app, match) {
         ctx.strokeStyle = 'rgba(140,190,255,0.5)'; ctx.lineWidth = 2; rr(ctx, sx, R.slotY, L.slotW, L.slotH, 10); ctx.stroke();
       }
       const cs = S.rows[rk];
-      const e = cs.length === CAP[rk] ? ev.evalHand(cs, rules) : null;
+      const e = cs.length === CAP[rk] ? evalRow(cs) : null;
       cs.forEach((c, j) => {
         if (dragging.indexOf(c) >= 0) return;
         const sx = slotX(L, rk, j);
@@ -2797,6 +2875,23 @@ function create(app, match) {
     }
     return null;
   }
+  // 滑动连选时只按横向位置找牌：手指在手牌区上下稍有偏移也能连续选中
+  function hitHandCardX(L, x) {
+    const hl = handLayout(L);
+    for (let i = hl.length - 1; i >= 0; i--) {
+      const h = hl[i];
+      if (x >= h.x && x <= h.x + h.w) return h.c;
+    }
+    return null;
+  }
+  let lastSelSound = 0;
+  function setSel(c, on) {
+    if (!!S.selected[c] === on) return;
+    if (on) S.selected[c] = true; else delete S.selected[c];
+    S.typeCycle = {};
+    const t = now();
+    if (t - lastSelSound > 60) { lastSelSound = t; audio.play('select'); }
+  }
   function hitSlotCard(L, x, y) {
     for (const rk of ROWS) {
       const R = rowRect(L, rk);
@@ -2856,7 +2951,15 @@ function create(app, match) {
       if (S.phase !== 'arranging' || S.submitted) return false;
       const L = layout();
       const c = hitHandCard(L, x, y);
-      if (c != null) { S.drag = { from: 'hand', c, sx: x, sy: y, x, y, active: false }; return true; }
+      if (c != null) {
+        // 按在未选中的牌上：立即选中，之后滑过的牌都选中。
+        // 按在已选中的牌上：先不动——往上拖就整组拖走；横滑或直接松手才取消选中
+        const mode = !S.selected[c];
+        if (mode) setSel(c, true);
+        const touched = {}; touched[c] = 1;
+        S.drag = { from: 'hand', mode, touched, pending: mode ? null : c, sx: x, sy: y, x, y, active: false };
+        return true;
+      }
       const sc = hitSlotCard(L, x, y);
       if (sc) { S.drag = { from: sc.row, c: sc.c, sx: x, sy: y, x, y, active: false }; return true; }
       return false;
@@ -2865,31 +2968,46 @@ function create(app, match) {
       const d = S.drag;
       if (!d) return;
       d.x = x; d.y = y;
-      if (!d.active && Math.abs(x - d.sx) + Math.abs(y - d.sy) > 18) {
-        d.active = true;
-        d.cards = d.from === 'hand' && S.selected[d.c] ? S.hand.filter(c => S.selected[c]) : [d.c];
+      const L = layout();
+      if (d.from === 'hand') {
+        if (!d.active) {
+          // 手指离开手牌区往上移动 → 变成拖动已选中的牌去放到某一道
+          const selectedNow = S.hand.filter(c => S.selected[c]);
+          if (y < L.handY - 40 && selectedNow.length) {
+            d.active = true;
+            d.cards = selectedNow;
+          } else if (y >= L.handY - 60) {
+            const c = hitHandCardX(L, x);
+            if (c != null && !d.touched[c]) {
+              if (d.pending != null) { setSel(d.pending, false); d.pending = null; }
+              d.touched[c] = 1; setSel(c, d.mode);
+            }
+          }
+        }
+        if (d.active) d.overRow = rowAt(L, x, y);
+        return;
       }
-      if (d.active) d.overRow = rowAt(layout(), x, y);
+      if (!d.active && Math.abs(x - d.sx) + Math.abs(y - d.sy) > 18) { d.active = true; d.cards = [d.c]; }
+      if (d.active) d.overRow = rowAt(L, x, y);
     },
     onTouchEnd(x, y) {
       const d = S.drag;
       S.drag = null;
       if (!d) return;
-      if (!d.active) {
-        // 当作点击
-        if (d.from === 'hand') {
-          if (S.selected[d.c]) delete S.selected[d.c]; else S.selected[d.c] = true;
-          S.typeCycle = {};
-          audio.play('select');
-        } else {
-          returnToHand([d.c]);
+      const L = layout();
+      if (d.from === 'hand') {
+        if (d.active) {
+          const target = rowAt(L, x, y);
+          if (target) placeCards(target, d.cards);
+        } else if (d.pending != null) {
+          setSel(d.pending, false); // 单点一张已选中的牌 = 取消选中
         }
         return;
       }
-      const L = layout();
+      if (!d.active) { returnToHand([d.c]); return; }
       const target = rowAt(L, x, y);
       if (target && target !== d.from) placeCards(target, d.cards);
-      else if (!target && d.from !== 'hand' && y > L.panelY + L.panelH) returnToHand(d.cards);
+      else if (!target && y > L.panelY + L.panelH) returnToHand(d.cards);
     },
     pause() { match.pause(); },
     resume() { match.resume(); }
